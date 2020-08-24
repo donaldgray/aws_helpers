@@ -84,7 +84,7 @@ class Operations:
         # verify new one is active
         self._wait_until_state('ACTIVE', f'ec2InstanceId != {instance_id}', cluster_name, running_tasks, False)
 
-        if not self._yes_or_no('new instance and active, all tasks drained from old. Remove old instance?'):
+        if not self._yes_or_no('new instance active, all tasks drained from old. Remove old instance?'):
             return
 
         self._autoscale.update_auto_scaling_group(AutoScalingGroupName=asg_name,
@@ -119,16 +119,16 @@ class Operations:
 
                 status = instance.get('status')
                 if status != target_state:
-                    print(f'New instance still in "{status}" state, wanting "{target_state}"')
+                    print(f'Instance still in "{status}" state, wanting "{target_state}"')
                     continue
 
                 # status is active, check counts
                 running_tasks = instance.get('runningTasksCount')
                 if running_task_target != -1 and running_tasks != running_task_target:
-                    print(f'New instance has {running_tasks} of a targeted {running_task_target} running tasks')
+                    print(f'Instance has {running_tasks} of a targeted {running_task_target} running tasks')
                     continue
 
-                print(f'New instance has the targeted {running_task_target} running tasks.')
+                print(f'Instance has the targeted {running_task_target} running tasks.')
                 instance_updated = True
             except Exception as e:
                 print(f'Error in _wait_until_state - {e}')
@@ -144,5 +144,3 @@ class Operations:
 
 if __name__ == '__main__':
     fire.Fire(Operations)
-    # operation = Operations("dlcsspinup")
-    # operation.replace_ecs_host("dlcsspinup-prod")
