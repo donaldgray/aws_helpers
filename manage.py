@@ -16,7 +16,7 @@ class Operations:
         self._ecs = session.client('ecs')
         self._autoscale = session.client('autoscaling')
 
-    def replace_ecs_host(self, cluster_name: str):
+    def replace_ecs_host(self, cluster_name: str, allow_pending=False):
         """
         Replace ECS host instance by scaling-out ASG, waiting and scaling-in
         """
@@ -37,12 +37,17 @@ class Operations:
         instance_id = target_instance.get('ec2InstanceId')
 
         pending_tasks = target_instance.get('pendingTasksCount')
+        running_tasks = target_instance.get('runningTasksCount')
+
+        target_tasks = running_tasks
 
         if pending_tasks > 0:
-            print(f'Instance "{instance_id}" has pending tasks, bailing')
-            return
-
-        running_tasks = target_instance.get('runningTasksCount')
+            if allow_pending:
+                print(f'Instance "{instance_id}" has pending tasks')
+                target_tasks = pending_tasks
+            else:
+                print(f'Instance "{instance_id}" has pending tasks, aborting')
+                return
 
         # get asg for instances
         asg_instances = self._autoscale.describe_auto_scaling_instances(InstanceIds=[instance_id])
@@ -82,7 +87,7 @@ class Operations:
         self._wait_until_state('DRAINING', f'ec2InstanceId == {instance_id}', cluster_name, 0)
 
         # verify new one is active
-        self._wait_until_state('ACTIVE', f'ec2InstanceId != {instance_id}', cluster_name, running_tasks, False)
+        self._wait_until_state('ACTIVE', f'ec2InstanceId != {instance_id}', cluster_name, target_tasks, False)
 
         if not self._yes_or_no('new instance active, all tasks drained from old. Remove old instance?'):
             return
@@ -92,7 +97,8 @@ class Operations:
                                                   MaxSize=1,
                                                   DesiredCapacity=1)
 
-    def _wait_until_state(self, target_state, container_filter, cluster_name, running_task_target=-1, wait_on_first=True):
+    def _wait_until_state(self, target_state, container_filter, cluster_name, running_task_target=-1,
+                          wait_on_first=True):
 
         print(f'waiting until container matching filter "{container_filter}" reaches "{target_state}"')
 
@@ -126,6 +132,11 @@ class Operations:
                 running_tasks = instance.get('runningTasksCount')
                 if running_task_target != -1 and running_tasks != running_task_target:
                     print(f'Instance has {running_tasks} of a targeted {running_task_target} running tasks')
+
+                    if running_task_target > running_tasks and target_state == 'ACTIVE':
+                        print(f'Instance is ACTIVE with more tasks that required, marking assuming done')
+                        instance_updated = True
+
                     continue
 
                 print(f'Instance has the targeted {running_task_target} running tasks.')
