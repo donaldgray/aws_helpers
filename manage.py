@@ -4,6 +4,10 @@ import fire
 from datetime import datetime
 
 
+def _version_key(v):
+    return [int(x) for x in v.split(".")]
+
+
 class Operations:
     """A collection of operations for managing AWS estate"""
 
@@ -33,26 +37,21 @@ class Operations:
 
         old_arns = []
         old_instance_ids = []
-        target_tasks_per_instance = 0
 
         for instance in instances:
             arn = instance.get("containerInstanceArn")
             instance_id = instance.get("ec2InstanceId")
             pending_tasks = instance.get("pendingTasksCount")
-            running_tasks = instance.get("runningTasksCount")
 
-            target_tasks = running_tasks
             if pending_tasks > 0:
                 if allow_pending:
                     print(f'Instance "{instance_id}" has pending tasks')
-                    target_tasks = pending_tasks
                 else:
                     print(f'Instance "{instance_id}" has pending tasks, aborting')
                     return
 
             old_arns.append(arn)
             old_instance_ids.append(instance_id)
-            target_tasks_per_instance = max(target_tasks_per_instance, target_tasks)
 
         instance_count = len(instances)
         print(f"Found {instance_count} instance(s) to replace")
@@ -73,6 +72,7 @@ class Operations:
 
         # remove scale-in protection from old instances
         asg_instances_map = {i.get("InstanceId"): i for i in asg_instances}
+        protected_ids = []
         for instance_id in old_instance_ids:
             asg_inst = asg_instances_map.get(instance_id, {})
             if not asg_inst.get("ProtectedFromScaleIn"):
@@ -83,11 +83,13 @@ class Operations:
                 print(
                     f'Removing instance protection from "{instance_id}" in asg "{asg_name}"..'
                 )
-                self._autoscale.set_instance_protection(
-                    InstanceIds=[instance_id],
-                    AutoScalingGroupName=asg_name,
-                    ProtectedFromScaleIn=False,
-                )
+                protected_ids.append(instance_id)
+        if protected_ids:
+            self._autoscale.set_instance_protection(
+                InstanceIds=protected_ids,
+                AutoScalingGroupName=asg_name,
+                ProtectedFromScaleIn=False,
+            )
 
         # double the ASG capacity
         new_desired = original_desired * 2
@@ -117,11 +119,8 @@ class Operations:
             cluster=cluster_name, containerInstances=old_arns, status="DRAINING"
         )
 
-        # wait for old instances to drain and new instances to be fully loaded
+        # wait for old instances to drain
         self._wait_for_instances_drained(cluster_name, old_arns)
-        self._wait_for_new_instances_ready(
-            cluster_name, old_arns, instance_count, target_tasks_per_instance
-        )
 
         if not self._yes_or_no(
             "New instances active, all tasks drained from old. Remove old instances?"
@@ -281,37 +280,6 @@ class Operations:
             except Exception as e:
                 print(f"Error waiting for drain: {e}")
 
-    def _wait_for_new_instances_ready(
-        self, cluster_name, old_arns, expected_count, target_tasks
-    ):
-        """Poll until new instances are ACTIVE with at least target_tasks each"""
-        print(
-            f"Waiting for {expected_count} new instance(s) to reach {target_tasks} task(s) each.."
-        )
-        while True:
-            print("Waiting 60s...")
-            time.sleep(60)
-            try:
-                new_arns = self._get_new_instance_arns(cluster_name, old_arns)
-                if len(new_arns) < expected_count:
-                    print(f"Found {len(new_arns)} of {expected_count} new instances")
-                    continue
-                instances = self._ecs.describe_container_instances(
-                    cluster=cluster_name, containerInstances=new_arns
-                ).get("containerInstances")
-                ready_count = sum(
-                    1
-                    for i in instances
-                    if i.get("status") == "ACTIVE"
-                    and i.get("runningTasksCount") >= target_tasks
-                )
-                print(f"{ready_count} of {expected_count} new instances ready")
-                if ready_count >= expected_count:
-                    print("All new instances ready")
-                    return
-            except Exception as e:
-                print(f"Error waiting for new instances to be ready: {e}")
-
     def _get_latest_minor_version(self, engine, major_version):
         """Return the latest minor version string for the given engine and major version"""
         response = self._rds.describe_db_engine_versions(
@@ -325,7 +293,7 @@ class Operations:
             raise ValueError(
                 f"No versions found for {engine} major version {major_version}"
             )
-        versions.sort(key=lambda v: [int(x) for x in v.split(".")])
+        versions.sort(key=_version_key)
         return versions[-1]
 
     def _build_upgrade_path(self, engine, current_version, target_version):
@@ -349,7 +317,7 @@ class Operations:
             candidates = [
                 t.get("EngineVersion")
                 for t in valid_targets
-                if [int(x) for x in t.get("EngineVersion").split(".")] <= target_parts
+                if _version_key(t.get("EngineVersion")) <= target_parts
             ]
 
             if not candidates:
@@ -359,7 +327,7 @@ class Operations:
                     f"Available targets from {version}: {available}"
                 )
 
-            candidates.sort(key=lambda v: [int(x) for x in v.split(".")])
+            candidates.sort(key=_version_key)
             next_version = candidates[-1]
             path.append(next_version)
             version = next_version
@@ -441,7 +409,7 @@ class Operations:
                 print(f"Error checking instance status: {e}")
 
     def _yes_or_no(self, question):
-        while "the answer is invalid":
+        while True:
             reply = str(input(f"{question} (y/n): ")).lower().strip()
             if reply[:1] == "y":
                 return True
