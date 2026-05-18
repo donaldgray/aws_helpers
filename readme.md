@@ -28,4 +28,10 @@ python manage.py replace_ecs_host my-cluster-name --profile my-profile --region 
 
 # force replacement even if there are pending tasks
 python manage.py replace_ecs_host my-cluster-name --allow_pending --profile my-profile --region eu-west-1
+
+# update an RDS instance to the latest minor version of a given major version
+python manage.py update_rds_instance my-rds-instance --version 14 --profile my-profile
+
+# update with an explicit snapshot name
+python manage.py update_rds_instance my-rds-instance --version 14 --snapshot_name my-snapshot --profile my-profile
 ```
