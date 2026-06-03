@@ -69,6 +69,7 @@ class Operations:
         original_min = asg_details.get("MinSize")
         original_max = asg_details.get("MaxSize")
         original_desired = asg_details.get("DesiredCapacity")
+        original_new_protected = asg_details.get("NewInstancesProtectedFromScaleIn")
 
         # remove scale-in protection from old instances
         asg_instances_map = {i.get("InstanceId"): i for i in asg_instances}
@@ -122,6 +123,14 @@ class Operations:
         # wait for old instances to drain
         self._wait_for_instances_drained(cluster_name, old_arns)
 
+        # capture the new instance ids so we can un-protect them once the old
+        # instances are removed (their protection was set via the ASG flag)
+        new_arns = self._get_new_instance_arns(cluster_name, old_arns)
+        new_instances = self._ecs.describe_container_instances(
+            cluster=cluster_name, containerInstances=new_arns
+        ).get("containerInstances")
+        new_instance_ids = [i.get("ec2InstanceId") for i in new_instances]
+
         if not self._yes_or_no(
             "New instances active, all tasks drained from old. Remove old instances?"
         ):
@@ -137,7 +146,20 @@ class Operations:
             MinSize=original_min,
             MaxSize=original_max,
             DesiredCapacity=original_desired,
+            NewInstancesProtectedFromScaleIn=original_new_protected,
         )
+
+        # remove scale-in protection from the surviving new instances
+        if new_instance_ids:
+            print(
+                f"Removing scale-in protection from {len(new_instance_ids)} "
+                f"new instance(s).."
+            )
+            self._autoscale.set_instance_protection(
+                InstanceIds=new_instance_ids,
+                AutoScalingGroupName=asg_name,
+                ProtectedFromScaleIn=False,
+            )
 
     def update_rds_instance(
         self, instance_name: str, version: int, snapshot_name: str = None
