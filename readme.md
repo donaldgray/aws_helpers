@@ -75,3 +75,25 @@ python manage.py update_rds_instance my-rds-instance --version 14 --profile my-p
 # specify a custom snapshot name (defaults to {instance-name}-{timestamp})
 python manage.py update_rds_instance my-rds-instance --version 14 --snapshot_name my-snapshot --profile my-profile
 ```
+
+---
+
+## `inventory`
+
+Collects an inventory of ECS, EC2 and RDS resources into a single CSV file. Each row has a `ResourceType` column, and columns not relevant to a resource type are left blank.
+
+**Fields collected:**
+
+- **ECS** (per service): cluster name, service name, launch type (`FARGATE` or `EC2`), vCPU and RAM (FARGATE only), current desired count, and min/max capacity (only if the service has autoscaling configured).
+- **EC2** (per instance): name (`Name` tag, else the `aws:autoscaling:groupName` tag, else blank), instance type, and root EBS volume size.
+- **RDS** (per instance): name, instance class, storage size, and engine version.
+
+**Usage:**
+
+```bash
+# write to the default file: inventory_{profile}_{timestamp}.csv
+python manage.py inventory --profile my-profile
+
+# specify an output file
+python manage.py inventory --profile my-profile --output my-inventory.csv
+```

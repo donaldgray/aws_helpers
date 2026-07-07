@@ -1,4 +1,5 @@
 import boto3
+import csv
 import time
 import fire
 from datetime import datetime
@@ -6,6 +7,12 @@ from datetime import datetime
 
 def _version_key(v):
     return [int(x) for x in v.split(".")]
+
+
+def _chunked(items, size):
+    """Yield successive chunks of at most `size` items from `items`"""
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
 class Operations:
@@ -17,10 +24,13 @@ class Operations:
         :param profile: AWS profile
         :param region: AWS region
         """
+        self._profile = profile
         session = boto3.Session(profile_name=profile, region_name=region)
         self._ecs = session.client("ecs")
         self._autoscale = session.client("autoscaling")
         self._rds = session.client("rds")
+        self._ec2 = session.client("ec2")
+        self._app_autoscale = session.client("application-autoscaling")
 
     def replace_ecs_host(self, cluster_name: str, allow_pending=False):
         """
@@ -240,9 +250,7 @@ class Operations:
 
         # steps 5-6: confirm upgrade plan then chain upgrades
         upgrade_plan = " -> ".join([current_version] + upgrade_path)
-        if not self._yes_or_no(
-            f'Upgrade "{new_instance_name}" via: {upgrade_plan}?'
-        ):
+        if not self._yes_or_no(f'Upgrade "{new_instance_name}" via: {upgrade_plan}?'):
             return
         self._chain_upgrades_from_path(new_instance_name, upgrade_path)
 
@@ -251,7 +259,203 @@ class Operations:
             f'Old instance "{instance_name}" is still running - verify and delete manually when ready.'
         )
 
+    def inventory(self, output: str = None):
+        """
+        Collect an inventory of ECS, EC2 and RDS resources into a single CSV file
+        """
+        if output is None:
+            timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            output = f"inventory_{self._profile}_{timestamp}.csv"
+
+        print("Collecting ECS inventory..")
+        ecs_rows = self._inventory_ecs()
+        print("Collecting EC2 inventory..")
+        ec2_rows = self._inventory_ec2()
+        print("Collecting RDS inventory..")
+        rds_rows = self._inventory_rds()
+
+        # each section has its own header row appropriate to the resource type
+        sections = [
+            (
+                [
+                    "ResourceType",
+                    "Cluster",
+                    "Service",
+                    "LaunchType",
+                    "vCPU",
+                    "RAM_MiB",
+                    "DesiredCount",
+                    "MinCapacity",
+                    "MaxCapacity",
+                ],
+                ecs_rows,
+            ),
+            (
+                ["ResourceType", "Name", "InstanceType", "StorageGB"],
+                ec2_rows,
+            ),
+            (
+                ["ResourceType", "Name", "InstanceType", "StorageGB", "EngineVersion"],
+                rds_rows,
+            ),
+        ]
+
+        total = 0
+        with open(output, "w", newline="") as f:
+            writer = csv.writer(f)
+            for fieldnames, rows in sections:
+                writer.writerow(fieldnames)
+                for row in rows:
+                    writer.writerow([row.get(field, "") for field in fieldnames])
+                    total += 1
+
+        print(f"Wrote {total} row(s) to {output}")
+
     # --- helpers ---
+
+    def _inventory_ecs(self):
+        """Return inventory rows for all ECS services across all clusters"""
+        rows = []
+        cluster_arns = []
+        paginator = self._ecs.get_paginator("list_clusters")
+        for page in paginator.paginate():
+            cluster_arns.extend(page.get("clusterArns", []))
+
+        for cluster_arn in cluster_arns:
+            cluster_name = cluster_arn.split("/")[-1]
+            service_arns = []
+            svc_paginator = self._ecs.get_paginator("list_services")
+            for page in svc_paginator.paginate(cluster=cluster_arn):
+                service_arns.extend(page.get("serviceArns", []))
+
+            # describe_services accepts at most 10 services per call
+            for chunk in _chunked(service_arns, 10):
+                services = self._ecs.describe_services(
+                    cluster=cluster_arn, services=chunk
+                ).get("services", [])
+                for service in services:
+                    rows.append(self._ecs_service_row(cluster_name, service))
+
+        return rows
+
+    def _ecs_service_row(self, cluster_name, service):
+        """Build a single inventory row for an ECS service"""
+        service_name = service.get("serviceName")
+        launch_type = self._service_launch_type(service)
+
+        vcpu = ""
+        ram = ""
+        if launch_type == "FARGATE":
+            task_def = self._ecs.describe_task_definition(
+                taskDefinition=service.get("taskDefinition")
+            ).get("taskDefinition", {})
+            cpu_units = task_def.get("cpu")
+            memory = task_def.get("memory")
+            if cpu_units:
+                vcpu = int(cpu_units) / 1024
+            if memory:
+                ram = memory
+
+        min_capacity = ""
+        max_capacity = ""
+        targets = self._app_autoscale.describe_scalable_targets(
+            ServiceNamespace="ecs",
+            ResourceIds=[f"service/{cluster_name}/{service_name}"],
+        ).get("ScalableTargets", [])
+        if targets:
+            min_capacity = targets[0].get("MinCapacity")
+            max_capacity = targets[0].get("MaxCapacity")
+
+        return {
+            "ResourceType": "ECS",
+            "Cluster": cluster_name,
+            "Service": service_name,
+            "LaunchType": launch_type,
+            "vCPU": vcpu,
+            "RAM_MiB": ram,
+            "DesiredCount": service.get("desiredCount"),
+            "MinCapacity": min_capacity,
+            "MaxCapacity": max_capacity,
+        }
+
+    def _service_launch_type(self, service):
+        """Determine whether a service runs on FARGATE or EC2"""
+        launch_type = service.get("launchType")
+        if launch_type:
+            return launch_type
+        # otherwise infer from the capacity provider strategy
+        for provider in service.get("capacityProviderStrategy", []):
+            name = provider.get("capacityProvider", "")
+            if "FARGATE" in name.upper():
+                return "FARGATE"
+        if service.get("capacityProviderStrategy"):
+            return "EC2"
+        return ""
+
+    def _inventory_ec2(self):
+        """Return inventory rows for all EC2 instances"""
+        rows = []
+        # gather all instances and their root volume ids
+        instances = []
+        volume_ids = set()
+        paginator = self._ec2.get_paginator("describe_instances")
+        for page in paginator.paginate():
+            for reservation in page.get("Reservations", []):
+                for instance in reservation.get("Instances", []):
+                    instances.append(instance)
+                    root_name = instance.get("RootDeviceName")
+                    for mapping in instance.get("BlockDeviceMappings", []):
+                        if mapping.get("DeviceName") == root_name:
+                            vol_id = mapping.get("Ebs", {}).get("VolumeId")
+                            if vol_id:
+                                volume_ids.add(vol_id)
+
+        # look up sizes for all root volumes in one pass
+        volume_sizes = {}
+        if volume_ids:
+            vol_paginator = self._ec2.get_paginator("describe_volumes")
+            for page in vol_paginator.paginate(VolumeIds=list(volume_ids)):
+                for vol in page.get("Volumes", []):
+                    volume_sizes[vol.get("VolumeId")] = vol.get("Size")
+
+        for instance in instances:
+            tags = {t.get("Key"): t.get("Value") for t in instance.get("Tags", [])}
+            name = tags.get("Name") or tags.get("aws:autoscaling:groupName") or ""
+            root_name = instance.get("RootDeviceName")
+            root_size = ""
+            for mapping in instance.get("BlockDeviceMappings", []):
+                if mapping.get("DeviceName") == root_name:
+                    vol_id = mapping.get("Ebs", {}).get("VolumeId")
+                    root_size = volume_sizes.get(vol_id, "")
+
+            rows.append(
+                {
+                    "ResourceType": "EC2",
+                    "Name": name,
+                    "InstanceType": instance.get("InstanceType"),
+                    "StorageGB": root_size,
+                }
+            )
+
+        return rows
+
+    def _inventory_rds(self):
+        """Return inventory rows for all RDS instances"""
+        rows = []
+        paginator = self._rds.get_paginator("describe_db_instances")
+        for page in paginator.paginate():
+            for instance in page.get("DBInstances", []):
+                rows.append(
+                    {
+                        "ResourceType": "RDS",
+                        "Name": instance.get("DBInstanceIdentifier"),
+                        "InstanceType": instance.get("DBInstanceClass"),
+                        "StorageGB": instance.get("AllocatedStorage"),
+                        "EngineVersion": f"{instance.get('Engine')} "
+                        f"{instance.get('EngineVersion')}",
+                    }
+                )
+        return rows
 
     def _get_new_instance_arns(self, cluster_name, old_arns):
         """Return ARNs of ACTIVE instances not in old_arns"""
@@ -274,9 +478,7 @@ class Operations:
                 instances = self._ecs.describe_container_instances(
                     cluster=cluster_name, containerInstances=new_arns
                 ).get("containerInstances")
-                active_count = sum(
-                    1 for i in instances if i.get("status") == "ACTIVE"
-                )
+                active_count = sum(1 for i in instances if i.get("status") == "ACTIVE")
                 print(f"{active_count} of {expected_count} new instances are ACTIVE")
                 if active_count >= expected_count:
                     print(f"All {expected_count} new instance(s) are ACTIVE")
@@ -332,8 +534,8 @@ class Operations:
                 Engine=engine,
                 EngineVersion=version,
             )
-            valid_targets = (
-                response.get("DBEngineVersions", [{}])[0].get("ValidUpgradeTarget", [])
+            valid_targets = response.get("DBEngineVersions", [{}])[0].get(
+                "ValidUpgradeTarget", []
             )
 
             candidates = [
